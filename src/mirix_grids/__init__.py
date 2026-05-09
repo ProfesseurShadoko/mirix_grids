@@ -1,9 +1,9 @@
 
 from oakley import *
-from grids_numpy import 
+from mirix_grids.src.mirix_grids.grids_numpy import 
 
 try:
     import torch
-    from grids_torch import *
+    from mirix_grids.src.mirix_grids.grids_torch import *
 except ImportError:
     pass
