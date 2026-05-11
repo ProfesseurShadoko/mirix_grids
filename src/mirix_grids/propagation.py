@@ -22,6 +22,7 @@
 from oakley import *
 import numpy as np
 from scipy.signal import fftconvolve
+from scipy.fft import next_fast_len
 import matplotlib.pyplot as plt
 import os
 import requests
@@ -135,28 +136,22 @@ class MirixGrid:
         # crop coeffs and components based on pca_k
         self.coefficients = self.coefficients[:, :, :self.pca_k]
         self.components = self.components[:self.pca_k, :, :]
-        # crop components based on psf_size
-        #psf_center = self.metadata["psf_shape"] // 2
-        #psf_half_size = self.psf_size // 2
-        #self.components = self.components[:, psf_center - psf_half_size : psf_center + psf_half_size + 1, psf_center - psf_half_size : psf_center + psf_half_size + 1]
-        # crop coefficients and grids based on grid_size
-        #grid_center = self.metadata["gridsize"] // 2
-        #grid_half_size = self.grid_size // 2
-        #self.coefficients = self.coefficients[:, grid_center - grid_half_size : grid_center + grid_half_size, grid_center - grid_half_size : grid_center + grid_half_size]
-        #self.xgrid = self.xgrid[grid_center - grid_half_size : grid_center + grid_half_size, grid_center - grid_half_size : grid_center + grid_half_size]
-        #self.ygrid = self.ygrid[grid_center - grid_half_size : grid_center + grid_half_size, grid_center - grid_half_size : grid_center + grid_half_size]
+        
+        # 5. Precompute FFTs
+        self.fft_shape = np.array(self.shape) + np.array(self.components.shape[1:]) - 1
+        # use next_fast_len to speed up FFTs
+        self.fast_fft_shape = [next_fast_len(s) for s in self.fft_shape]
+        self.components_fft = np.fft.fft2(self.components, s=self.fast_fft_shape, axes=(1, 2)) # shape (pca_k, ny, nx)
+        self.components_fft = self.components_fft.transpose((1, 2, 0)) # shape (ny, nx, pca_k)
         
         Message("Data shapes after reshape:").list({
             "components": self.components.shape,
             "coefficients": self.coefficients.shape,
             "xgrid": self.xgrid.shape,
             "ygrid": self.ygrid.shape,
+            "components_fft": self.components_fft.shape,
         })
         
-        # 5. Everyone becomes a torch tensor
-        # self.components = torch.tensor(self.components, device=device, dtype=dtype)
-        # self.coefficients = torch.tensor(self.coefficients, device=device, dtype=dtype)
-    
     @property
     def shape(self) -> tuple:
         """
@@ -190,14 +185,13 @@ class MirixGrid:
         
         # 4. Correlate with PSFs using fftconvolve from scipy
         out = np.zeros_like(image) # shape (ny, nx)
-        with Task("Propagating image..."):
-            for k in range(self.pca_k):
-                out += fftconvolve(
-                    coeffs[:, :, k], # shape (ny, nx)
-                    components[k], # shape (psf_ny, psf_nx)
-                    mode="same" # shape of output = shape of input
-                )
-        return out
+        for k in range(self.pca_k):
+            out += fftconvolve(
+                coeffs[:, :, k], # shape (ny, nx)
+                components[k], # shape (psf_ny, psf_nx)
+                mode="same" # shape of output = shape of input
+            )
+        return out        
         
         
     
@@ -214,9 +208,37 @@ class MirixGrid:
         in Fourier space first, and then only do one inverse Fourier transform at the end th get the final
         propagated image. This should be faster.
         """
-        pass
-
-    
+        
+        assert image.ndim == 2, f"Input image should be 2D, but got shape {image.shape}."
+        assert image.shape == self.shape, f"Input image shape {image.shape} does not match the grid shape {self.shape}."
+        
+        # shape of the result of the convolution
+        
+        # 0. Compute FFTs of the components
+        # => will be precomputed and stored in init later
+        
+        # 1. Get the coefficients
+        coeffs = self.coefficients # shape (ny, nx, pca_k)
+        coeffs = coeffs * image[:, :, np.newaxis] # shape (ny, nx, pca_k)
+        
+        # 2. Go to Fourier space
+        coeffs_fft = np.fft.fft2(coeffs, s=self.fast_fft_shape, axes=(0, 1)) # shape (ny, nx, pca_k)
+        
+        # 3. Apply convolution in Fourier space (which is just a multiplication)
+        propagated_ffts_per_components = coeffs_fft * self.components_fft # shape (ny, nx, pca_k)
+        propagated_fft = np.sum(propagated_ffts_per_components, axis=2) # shape (ny, nx)
+        
+        # 4. Go back to real space
+        propagate = np.fft.ifft2(propagated_fft, s=self.fast_fft_shape).real # shape (ny, nx)
+        
+        # 5. Center the result and crop to match the input shape
+        current_shape = np.array(self.fft_shape)
+        initial_shape = np.array(image.shape)
+        start_index = (current_shape - initial_shape) // 2
+        end_index = start_index + initial_shape
+        return propagate[start_index[0]:end_index[0], start_index[1]:end_index[1]]
+        
+        
     # ------------- #
     # !-- Utils --! #
     # ------------- #
