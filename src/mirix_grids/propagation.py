@@ -8,6 +8,12 @@
 # x,y means separation in oversampled pixels, with (0,0) the center of the grid
 # and in arcsec is x_arcsec, y_arcsec, with (0,0) the center of the grid as well
 
+# todo: for torch precompute the components in fourier space
+# reimplement convolution myself
+# precompute the correct padding (see conversation with chatgpt)
+# check about kernel sizes and all, make sure how fftconvolve will work with that
+# sum the k components in fourier space, as the fourier transform is linear!
+
 
 # --------------- #
 # !-- Imports --! #
@@ -164,6 +170,39 @@ class MirixGrid:
     
     def forward(
         self,
+        image: np.ndarray
+    ):
+        """
+        Propagates a 2D image through the PSF grid, by convolving (or rather correlating) the image with
+        the PSF at each position of the grid.
+        """
+        
+        # 1. Check input
+        assert image.ndim == 2, f"Input image should be 2D, but got shape {image.shape}."
+        assert image.shape == self.shape, f"Input image shape {image.shape} does not match the grid shape {self.shape}."
+        
+        # 2. Get the coefficients and components
+        coeffs = self.coefficients # shape (ny, nx, pca_k)
+        components = self.components # shape (pca_k, psf_my, psf_mx)
+        
+        # 3. Propagate in coefficient space
+        coeffs = coeffs * image[:, :, np.newaxis] # shape (ny, nx, pca_k)
+        
+        # 4. Correlate with PSFs using fftconvolve from scipy
+        out = np.zeros_like(image) # shape (ny, nx)
+        with Task("Propagating image..."):
+            for k in range(self.pca_k):
+                out += fftconvolve(
+                    coeffs[:, :, k], # shape (ny, nx)
+                    components[k], # shape (psf_ny, psf_nx)
+                    mode="same" # shape of output = shape of input
+                )
+        return out
+        
+        
+    
+    def forward_opt(
+        self,
         #image: torch.Tensor
         image: np.ndarray
     ) -> np.ndarray:
@@ -226,6 +265,73 @@ class MirixGrid:
     # !-- Utils --! #
     # ------------- #
     
+    def get_indices(
+        self, *args,
+        i:int|np.ndarray = None, j:int|np.ndarray = None,
+        x:float|np.ndarray = None, y:float|np.ndarray = None,
+        x_arcsec:float|np.ndarray = None, y_arcsec:float|np.ndarray = None,
+    ) -> tuple:
+        """
+        Translates a position in the grid, given in either indeces (in which case they are directly returned),
+        separation in (oversampled) pixels, relative to the center of the grid, or separation in arcseconds,
+        relative to the center of the grid.
+        
+        Parameters
+        ----------
+        i, j: int or np.ndarray, optional
+            The indices of the position(s) in the grid. Should be between 0 and `self.shape[0] - 1`.
+        x, y: float or np.ndarray, optional
+            The separation(s) from the center of the grid in the x and y directions, in oversampled pixels.
+            These must be half integers (`x%1=0.5`) as the grid is even, hence the center lies between four pixels,
+            and therefore the closest pixels to the center are at a separation of 0.5 oversampled pixels in each direction.
+        x_arcsec, y_arcsec: float or np.ndarray, optional
+            The separation(s) from the center of the grid in the x and y directions, in arcseconds.
+            These will be converted to oversampled pixels using the pixel scale of MIRI (0.11" / oversample).
+        
+        
+        Notes
+        -----
+        This function only accepts keyword arguments, and will raise an error if any positional argument is given.
+        
+        If numpy arrays are passed, numpy arrays of the same shape are returned.      
+        
+        Separations in arcseconds will be converted to the closest matching pixel position on the grid. Other arguments
+        need to be spot on on a pixel. 
+        """
+        assert len(args) == 0, f"All arguments should be passed as keyword arguments, but got {len(args)} positional arguments."
+        
+        # 1. Check that only one type of argument is given
+        num_args = sum(arg is not None for arg in [i, j, x, y, x_arcsec, y_arcsec])
+        assert num_args > 0, "At least one argument should be given."
+        assert num_args == 2, "Exactly two arguments should be given, one for x and one for y. For instance, if i is given, j should also be given, and if x is given, y should also be given, and if x_arcsec is given, y_arcsec should also be given."
+        assert (i is not None and j is not None) or (x is not None and y is not None) or (x_arcsec is not None and y_arcsec is not None), "Arguments should be given in pairs, either (i, j), or (x, y), or (x_arcsec, y_arcsec)."
+        
+        # 2. If arguments are given in arcseconds, convert to oversampled pixels
+        if x_arcsec is not None and y_arcsec is not None:
+            pixel_scale = 0.11 / self.metadata["oversample"] # arcsec / oversampled pixel
+            x = x_arcsec / pixel_scale
+            y = y_arcsec / pixel_scale
+            
+            # round to the closest half integer
+            x = np.round(x * 2) / 2
+            y = np.round(y * 2) / 2
+        
+        # 3. If arguments are given in oversampled pixels, convert to indices
+        if x is not None and y is not None:
+            # check that x and y are half integers
+            assert np.all(np.isclose(x % 1, 0.5, rtol=1e-5)), f"x should be half integers, but got {x}."
+            assert np.all(np.isclose(y % 1, 0.5, rtol=1e-5)), f"y should be half integers, but got {y}."
+            i = np.round(x + (self.shape[1] - 1) / 2).astype(int)
+            j = np.round(y + (self.shape[0] - 1) / 2).astype(int)
+        
+        # 4. Check that indices are integers, and within the grid
+        assert isinstance(i, int) or np.issubdtype(i.dtype, np.integer), f"i should be integers, but got {i}."
+        assert isinstance(j, int) or np.issubdtype(j.dtype, np.integer), f"j should be integers, but got {j}."
+        assert np.all((0 <= i) & (i < self.shape[1])), f"i should be between 0 and {self.shape[1] - 1}, but got {i}."
+        assert np.all((0 <= j) & (j < self.shape[0])), f"j should be between 0 and {self.shape[0] - 1}, but got {j}."
+        
+        return i, j
+        
     def grid(
         self, *args,
         i:int = None, j:int = None,
@@ -234,56 +340,30 @@ class MirixGrid:
     ) -> np.ndarray:
         """
         Reconstruct the PSF at a given position on the grid, by simply multiplying
-        the PCA components by the coefficients at the given position
-        RESUME HERE
-        
-        
-        Returns the PSF at a given position on the grid, given by its indices x_index and y_index.
-        The separation from the center of the grid can be obtained by looking at the xgrid
-        and ygrid attributes, which give the separation in oversampled pixels.
+        the PCA components by the coefficients at the given position, and summing them up.
         
         Parameters
         ----------
-        x_index : int
-            The index of the grid in the x direction. Should be between 0 and the number of pixels in x direction - 1.
-        y_index : int
-            The index of the grid in the y direction. Should be between 0 and the number of pixels in y direction - 1.
+        i, j, x, y, x_arcsec, y_arcsec
+            See `get_indices()`. However, numpy arrays cannot be used here.
         """
-        assert len(args) == 0, f"All arguments should be passed as keyword arguments, but got {len(args)} positional arguments."
-        assert 0 <= x_index < self.shape[1], f"x_index should be between 0 and {self.shape[1]-1}, but got {x_index}."
-        assert 0 <= y_index < self.shape[0], f"y_index should be between 0 and {self.shape[0]-1}, but got {y_index}."
         
-        # 1. Get coefficients at the given position
-        coeffs = self.coefficients[y_index, x_index] # shape (pca_k,)
+        # 1. Get the indices corresponding to the given position
+        i, j = self.get_indices(
+            i=i, j=j,
+            x=x, y=y,
+            x_arcsec=x_arcsec, y_arcsec=y_arcsec,
+        )
+        assert isinstance(i, int) and isinstance(j, int) or np.issubdtype(i.dtype, np.integer) and np.issubdtype(j.dtype, np.integer), f"i and j should be integers, but got {i} and {j}."
         
-        # 2. Get the components, and multiply by coefficients
+        # 2. Get coefficients
+        coeffs = self.coefficients[j, i] # shape (pca_k,)
+        
+        # 3. Get the components, and multiply by coefficients
         psf = np.sum(coeffs[:, np.newaxis, np.newaxis] * self.components, axis=0) # shape (psf_ny, psf_nx)
         return psf
     
-    def grid_from_separation(
-        self, x_sep:float, y_sep:float,
-        pixel2unit:float = 1
-    ) -> np.ndarray:
-        """
-        Returns the PSF at a given separation from the center of the grid, in oversampled pixels. The separation can be converted to arcseconds by multiplying by the pixel scale of MIRI (0.11" / oversample).
-        
-        Parameters
-        ----------
-        x_sep : float
-            The separation from the center of the grid in the x direction, in oversampled pixels.
-        y_sep : float
-            The separation from the center of the grid in the y direction, in oversampled pixels.
-        pixel2unit : float, optional
-            The conversion factor from (oversampled) pixels to the desired unit for x_sep and y_sep.
-            For instance, if x_sep and y_sep are given in arcseconds, and the pixel scale is 0.11" / oversample,
-            then pixel2unit should be 0.11 / oversample.
-        """
-        # 1. Get indices corresponding to the given separation
-        x_index = int(np.round(x_sep / pixel2unit + (self.shape[1] - 1) / 2))
-        y_index = int(np.round(y_sep / pixel2unit + (self.shape[0] - 1) / 2))
-        
-        return self.grid(x_index, y_index)
-    
+   
     def dirac(
         self, i:int | np.ndarray, j:int | np.ndarray
     ) -> np.ndarray:
@@ -293,75 +373,39 @@ class MirixGrid:
         
         Parameters
         ----------
-        x : int or np.ndarray
+        i : int or np.ndarray
             The x coordinate(s) of the position(s) where the dirac should be centered,
-            in oversampled pixels, in indeces (not relative to the center of the grid).
-        y : int or np.ndarray
+            in indices (not relative to the center of the grid). Should be between 0 and `self.shape[1] - 1`.
+        j : int or np.ndarray
             The y coordinate(s) of the position(s) where the dirac should be centered,
-            in oversampled pixels, in indeces (not relative to the center of the grid).    
+            in indices (not relative to the center of the grid). Should be between 0 and `self.shape[0] - 1`.
         
         Returns
         -------
         np.ndarray
             A dirac image of same shape as the grid, with a single pixel equal to 1 at the given position,
-            and all other pixels equal to 0. If x and y are arrays, the output will be a stack of dirac images,
-            one for each position given by the corresponding elements of x and y.
+            and all other pixels equal to 0. If i and j are arrays, the output will be a stack of dirac images,
+            one for each position given by the corresponding elements of i and j.
+            
+        Notes
+        -----
+        If you need to create a dirac from a given separation, in oversampled pixels or in arcseconds,
+        you can use the `get_indices()` method to convert the separation to indices, and then use this `dirac()`
+        method to create the dirac image.
         """
-        if np.isscalar(x) and np.isscalar(y):
+        if np.isscalar(i) and np.isscalar(j):
             dirac = np.zeros(self.shape)
-            dirac[int(y), int(x)] = 1
+            dirac[int(j), int(i)] = 1
             return dirac
         else:
-            if x.shape != y.shape:
-                raise ValueError(f"x and y should be both scalars or 1D arrays of the same shape, but got shapes {x.shape} and {y.shape}.")
-            N = len(x)
+            if i.shape != j.shape:
+                raise ValueError(f"i and j should be both scalars or 1D arrays of the same shape, but got shapes {i.shape} and {j.shape}.")
+            N = len(i)
             diracs = np.zeros((N, *self.shape))
-            diracs[np.arange(N), y.astype(int), x.astype(int)] = 1
+            diracs[np.arange(N), j.astype(int), i.astype(int)] = 1
             return diracs
         
-   
-    def sgd_plot(self) -> None:
-        """
-        A small debug function. Plots the four PSFs closest to the center of the grid.
-        """
-        top_left = [-0.5, 0.5]
-        top_right = [0.5, 0.5]
-        bottom_left = [-0.5, -0.5]
-        bottom_right = [0.5, -0.5]
-        #psfs = self.psf(
-        #    x = np.array([top_left[0], top_right[0], bottom_left[0], bottom_right[0]]),
-        #    y = np.array([top_left[1], top_right[1], bottom_left[1], bottom_right[1]]),
-        #)
-        diracs = self.dirac(
-            x = np.array([top_left[0], top_right[0], bottom_left[0], bottom_right[0]]),
-            y = np.array([top_left[1], top_right[1], bottom_left[1], bottom_right[1]]),
-        )
-        psfs = self.forward(diracs)
-        Message(f"Shape of PSFs: {psfs.shape}")
-        return
-        
-        plt.figure(figsize=(15, 10))
-        for i, coords in enumerate([top_left, top_right, bottom_left, bottom_right]):
-            plt.subplot(2, 2, i + 1)
-            plot_image2d(
-                psfs[i],
-                qmin=0,
-                qmax=1,
-                log_scale=False,
-                colormap="plasma",
-                colorbar_shrink=0.8,
-                colorbar_label="Normalized flux",
-                pixel_scale_arcsec=0.11 / self.metadata["oversample"],
-            )
-            plt.title(f"PSF at x={coords[0]}, y={coords[1]}")
-            
-            plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
-        plt.tight_layout()
-        plt.savefig("sgd_plot.png")
-        plt.show()
-        
-        
-        
+      
     
    
         
@@ -490,16 +534,107 @@ if __name__ == "__main__":
         "mirix_grids/src/mirix_grids/data/grid_filter-F1140C_nlambda-1_oversample-4_date-2023-09-04_psfshape-183_gridshape-272_psfoversample-2_pca_k-200.fits",
     )
     
-    separations = [0.5, 0.5]
-    # find the i, j indices corresponding to these separations
-    radial_distances = np.sqrt((mxgrid.xgrid - separations[0])**2 + (mxgrid.ygrid - separations[1])**2)
-    i,j = np.unravel_index(np.argmin(radial_distances), radial_distances.shape)
+    # ---------------------------- #
+    # !-- Test convert indices --! #
+    # ---------------------------- #
     
-    psf = mxgrid.grid(i, j)
+    sep_x, sep_y = 20.5, 5.5
+    sep_x_np, sep_y_np = np.array([sep_x, sep_x+10]), np.array([sep_y, sep_y+10])
     
-    plt.figure(figsize=(5, 5))
-    plot_image2d(   
-        psf,
+    grid_center_y, grid_center_x = (mxgrid.shape[0] - 1) / 2, (mxgrid.shape[1] - 1) / 2
+    sep_x_arcsec = sep_x * 0.11 / mxgrid.metadata["oversample"]
+    sep_y_arcsec = sep_y * 0.11 / mxgrid.metadata["oversample"]
+    sep_x_arcsec_np = sep_x_np * 0.11 / mxgrid.metadata["oversample"]
+    sep_y_arcsec_np = sep_y_np * 0.11 / mxgrid.metadata["oversample"]
+    i = int(np.round(sep_x + grid_center_x))
+    j = int(np.round(sep_y + grid_center_y))
+    i_np = np.round(sep_x_np + grid_center_x).astype(int)
+    j_np = np.round(sep_y_np + grid_center_y).astype(int)
+    
+    Message.title("Test: get_indices()")
+    Message("Inputs and outputs for get_indices():").list({
+        "Separation in pixels": f"{sep_x, sep_y} -> {mxgrid.get_indices(x=sep_x, y=sep_y)}",
+        "Separation in pixels (numpy)": f"{sep_x_np, sep_y_np} -> {mxgrid.get_indices(x=sep_x_np, y=sep_y_np)}",
+        "Separation in arcseconds": f"{sep_x_arcsec:.2f}\", {sep_y_arcsec:.2f}\" -> {mxgrid.get_indices(x_arcsec=sep_x_arcsec, y_arcsec=sep_y_arcsec)}",
+        "Separation in arcseconds (numpy)": f"{sep_x_arcsec_np}, {sep_y_arcsec_np} -> {mxgrid.get_indices(x_arcsec=sep_x_arcsec_np, y_arcsec=sep_y_arcsec_np)}",
+        "Separation in indices": f"{i, j} -> {mxgrid.get_indices(i=i, j=j)}",
+        "Separation in indices (numpy)": f"{i_np, j_np} -> {mxgrid.get_indices(i=i_np, j=j_np)}"
+    })
+    
+    
+    # ------------------- #
+    # !-- Test diracs --! #
+    # ------------------- #
+    
+    Message.title("Test: dirac()")
+    i, j = mxgrid.get_indices(x=sep_x_np, y=sep_y_np)
+    diracs = mxgrid.dirac(i=i, j=j) # here i and j are arrays, so we should get a stack of dirac images
+    Message(f"Shape of diracs: {cstr(diracs.shape):cb} (should be (2, {mxgrid.shape[0]}, {mxgrid.shape[1]}))")
+    
+    # let's make a plot
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plot_image2d(
+        diracs[0],
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="plasma",
+        colorbar_shrink=0.8,
+        colorbar_label="Pixel value",
+        pixel_scale_arcsec=0.11 / mxgrid.metadata["oversample"],
+    )
+    plt.title(f"Dirac at x={sep_x_arcsec_np[0]}\", y={sep_y_arcsec_np[0]}\"")
+    plt.scatter(sep_x_arcsec_np[0], sep_y_arcsec_np[0], color="cyan", marker="o", facecolor="none", s=20, label="Dirac position")
+    plt.legend()
+    plt.subplot(1, 2, 2)
+    plot_image2d(
+        diracs[1],
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="plasma",
+        colorbar_shrink=0.8,
+        colorbar_label="Pixel value",
+        pixel_scale_arcsec=0.11 / mxgrid.metadata["oversample"],
+    )
+    plt.title(f"Dirac at x={sep_x_arcsec_np[1]}\", y={sep_y_arcsec_np[1]}\"")
+    plt.scatter(sep_x_arcsec_np[1], sep_y_arcsec_np[1], color="cyan", marker="o", facecolor="none", s=20, label="Dirac position")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("diracs.png")
+    plt.show()
+    
+    
+    # ----------------- #
+    # !-- Test Grid --! #
+    # ----------------- #
+    
+    Message.title("Test: grid()")
+    x1, y1 = 0.5, 0.5 # a centered PSF
+    x2, y2 = 10.5, 10.5 # a PSF far from the center
+    psf1 = mxgrid.grid(x=x1, y=y1)
+    psf2 = mxgrid.grid(x=x2, y=y2)
+    
+    # ------------------------ #
+    # !-- Test propagation --! #
+    # ------------------------ #
+    
+    dirac1 = mxgrid.dirac(*mxgrid.get_indices(x=x1, y=y1))
+    dirac2 = mxgrid.dirac(*mxgrid.get_indices(x=x2, y=y2))
+    propagated1 = mxgrid.forward(dirac1)
+    propagated2 = mxgrid.forward(dirac2)
+    
+    # zoom on propagated1 and 2 to match the shape of dirac1 and dirac2
+    propagated1 = crop_to(propagated1, psf1.shape[0] - 1)
+    propagated2 = crop_to(propagated2, psf2.shape[0] - 1)
+    
+    
+    
+    plt.figure(figsize=(10, 10))
+    plt.subplot(2, 2, 1)
+    plot_image2d(
+        psf1,
         qmin=0,
         qmax=1,
         log_scale=False,
@@ -508,16 +643,57 @@ if __name__ == "__main__":
         colorbar_label="Normalized flux",
         pixel_scale_arcsec=0.11 / mxgrid.metadata["oversample"],
     )
-    #plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
+    plt.title(f"PSF at x={x1}, y={y1}")
+    plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
     #plt.legend()
+    plt.subplot(2, 2, 2)
+    plot_image2d(   
+        psf2,
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="plasma",
+        colorbar_shrink=0.8,
+        colorbar_label="Normalized flux",
+        pixel_scale_arcsec=0.11 / mxgrid.metadata["oversample"],
+    )
+    plt.title(f"PSF at x={x2}, y={y2}")
+    plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
+    #plt.legend()
+    
+    plt.subplot(2, 2, 3)
+    plot_image2d(
+        propagated1,
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="plasma",
+        colorbar_shrink=0.8,
+        colorbar_label="Normalized flux",
+        pixel_scale_arcsec=1,
+    )
+    plt.title(f"Propagated dirac at x={x1}, y={y1}")
+    plt.scatter(x1, y1, color="red", marker="+", s=100, label="Dirac position")
+    plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
+    #plt.legend()
+    plt.subplot(2, 2, 4)
+    plot_image2d(
+        propagated2,    
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="plasma",
+        colorbar_shrink=0.8,
+        colorbar_label="Normalized flux",
+        pixel_scale_arcsec=1,
+    )
+    plt.title(f"Propagated dirac at x={x2}, y={y2}")   
+    plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
+    plt.scatter(x2, y2, color="red", marker="+", s=100, label="Dirac position")
+    plt.legend()
+    
     plt.tight_layout()
-    plt.savefig("test_psf.png")
+    plt.savefig("psfs.png")
     plt.show()
     
-    # create a dirac image at the position of the psf
-    image = mxgrid.dirac(x=j, y=i)
-    
-    psf = mxgrid.forward(
-        im
-    )
     
