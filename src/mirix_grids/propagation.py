@@ -203,62 +203,18 @@ class MirixGrid:
     
     def forward_opt(
         self,
-        #image: torch.Tensor
         image: np.ndarray
     ) -> np.ndarray:
         """
-        Propagates an image through the PSF grid, by convolving (or rather correlating) the image with
-        the PSF at each position of the grid. The output is an image of same shape as the input image.
+        This function is an improvement over the `forward()` function in terms of speed and
+        parallelization. The core idea is that one won't do propagation once but several times,
+        which means that we can precompute the Fourier transform of the components.
         
-        Parameters
-        ----------
-        image : np.ndarray
-            The input image to be propagated through the grid. Can be of any shape, but the last two dimensions
-            should correspond respectively to the y and x dimensions of the image, and match the grid shape.
-        pca_k : int, optional
-            The number of PCA components to use for the propagation. If None, all components will be used.
-        
-        Returns
-        -------
-        np.ndarray
-            The propagated image, of same shape as the input image.
+        Moreover, we can take advantage of the linearity of the Fourier transform, to sum the components
+        in Fourier space first, and then only do one inverse Fourier transform at the end th get the final
+        propagated image. This should be faster.
         """
-        #return image
-        
-        # 1. Check the shape of the input image
-        if image.shape[-2:] != self.shape:
-            raise ValueError(f"Input image shape {image.shape[-2:]} does not match the grid shape {self.shape}.")
-        
-        # 3. Flatten the image to a batch of images
-        image_flat = image.reshape(-1, 1, *self.shape) # shape (batch_size, 1, ny, nx)
-        
-        # 4. Multiply coefficients
-        coeffs = self.coefficients
-        coeffs = image_flat * coeffs.reshape(1, self.pca_k, *self.shape) # shape (batch_size, pca_k, ny, nx)
-        
-        # 5. Correlate (yes conv2d correlates without flipping kernels)
-        #out = F.conv2d(
-        #    coeffs, # shape (batch_size, pca_k, ny, nx)
-        #    self.components.reshape(self.pca_k, 1, *self.components.shape[-2:]), # shape (pca_k, 1, psf_ny, psf_nx)
-        #    padding="same", # shape of output = shape of input
-        #    groups=self.pca_k, # each component is convolved with its own PSF component
-        #)
-        
-        # 5. Correlate with scipy
-        out = np.zeros_like(image).reshape(-1, self.shape[0], self.shape[1]) # shape (batch_size, ny, nx)
-        
-        with Task("Propagating image..."):
-            for b in range(out.shape[0]):
-                for k in range(self.pca_k):
-                    out[b] += fftconvolve(
-                        coeffs[b, k], # shape (ny, nx)
-                        self.components[k][::-1, ::-1], # shape (psf_ny, psf_nx) # flip the kernel to get correlation instead of convolution
-                        mode="same" # shape of output = shape of input
-                    )        
-        
-        # 6. Reshape the output to match the input image shape
-        out = out.reshape(*image.shape)
-        return out
+        pass
 
     
     # ------------- #
@@ -631,8 +587,8 @@ if __name__ == "__main__":
     
     
     
-    plt.figure(figsize=(10, 10))
-    plt.subplot(2, 2, 1)
+    plt.figure(figsize=(10, 15))
+    plt.subplot(3, 2, 1)
     plot_image2d(
         psf1,
         qmin=0,
@@ -646,7 +602,7 @@ if __name__ == "__main__":
     plt.title(f"PSF at x={x1}, y={y1}")
     plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
     #plt.legend()
-    plt.subplot(2, 2, 2)
+    plt.subplot(3, 2, 2)
     plot_image2d(   
         psf2,
         qmin=0,
@@ -661,7 +617,7 @@ if __name__ == "__main__":
     plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
     #plt.legend()
     
-    plt.subplot(2, 2, 3)
+    plt.subplot(3, 2, 3)
     plot_image2d(
         propagated1,
         qmin=0,
@@ -676,7 +632,7 @@ if __name__ == "__main__":
     plt.scatter(x1, y1, color="red", marker="+", s=100, label="Dirac position")
     plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
     #plt.legend()
-    plt.subplot(2, 2, 4)
+    plt.subplot(3, 2, 4)
     plot_image2d(
         propagated2,    
         qmin=0,
@@ -691,6 +647,48 @@ if __name__ == "__main__":
     plt.scatter(0, 0, color="cyan", marker="+", s=100, label="Center of the grid")
     plt.scatter(x2, y2, color="red", marker="+", s=100, label="Dirac position")
     plt.legend()
+    
+    # let's check the difference => we need to crop one row and one column again to match the shapes
+    psf1 = psf1[1:, 1:]
+    psf2 = psf2[1:, 1:]
+    # we also need to roll the porpagated images by the number of pixels
+    propagated1 = np.roll(propagated1, shift=(-int(y1)-1, -int(x1)-1), axis=(0, 1))
+    propagated2 = np.roll(propagated2, shift=(-int(y2)-1, -int(x2)-1), axis=(0, 1))
+    
+    diff1 = (propagated1 - psf1) / np.max(psf1)
+    diff2 = (propagated2 - psf2) / np.max(psf2)
+    
+    # let's further crop to exclude the boerders where numpy rolls
+    crop = diff1.shape[0] - int(max(y1, y2, x1, x2)+1)*2
+    diff1 = crop_to(diff1, crop)
+    diff2 = crop_to(diff2, crop)
+    
+    plt.subplot(3, 2, 5)
+    plot_image2d(
+        diff1,  
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="bwr",
+        colorbar_shrink=0.8,
+        colorbar_label="Difference in flux",
+        pixel_scale_arcsec=1,
+    )
+    plt.title(f"Relative difference at x={x1}, y={y1}")
+    
+    plt.subplot(3, 2, 6)
+    plot_image2d(
+        diff2,  
+        qmin=0,
+        qmax=1,
+        log_scale=False,
+        colormap="bwr",
+        colorbar_shrink=0.8,
+        colorbar_label="Difference in flux",
+        pixel_scale_arcsec=1,
+    )
+    plt.title(f"Relative difference at x={x2}, y={y2}")
+    
     
     plt.tight_layout()
     plt.savefig("psfs.png")

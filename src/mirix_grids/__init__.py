@@ -1,9 +1,9 @@
 
 from oakley import *
-from mirix_grids.src.mirix_grids.propagation import 
+from .propagation import MirixGrid
 
 try:
     import torch
-    from mirix_grids.src.mirix_grids.grids_torch import *
+    from .gpu_propagation import MirixGridGPU
 except ImportError:
-    pass
+    from .failed_gpu_propagation import BlockedMirixGridGPU as MirixGridGPU
