@@ -1,19 +1,6 @@
 
 
 
-# todo:
-# make every function take no positional arguments
-# only kwargs
-# i,j means indeces
-# x,y means separation in oversampled pixels, with (0,0) the center of the grid
-# and in arcsec is x_arcsec, y_arcsec, with (0,0) the center of the grid as well
-
-# todo: for torch precompute the components in fourier space
-# reimplement convolution myself
-# precompute the correct padding (see conversation with chatgpt)
-# check about kernel sizes and all, make sure how fftconvolve will work with that
-# sum the k components in fourier space, as the fourier transform is linear!
-
 
 # --------------- #
 # !-- Imports --! #
@@ -23,6 +10,7 @@ from oakley import *
 import numpy as np
 from scipy.signal import fftconvolve
 from scipy.fft import next_fast_len
+import scipy as sp
 import matplotlib.pyplot as plt
 import os
 import requests
@@ -64,16 +52,8 @@ class MirixGrid:
             The path to the FITS file containing the grid. If the file doesn't exist in the working directory,
             the function will look for it in the default folder.
             
-        Notes
-        -----
-        Both device and dtype parameters need to match the ones used for the input image of the :meth:`forward()` method.
-        The use of `torch` instead of `numpy` or `scipy` is motivated by the fact that only `torch` can do
-        a convolution (or correlation) on a batch of images / components at once. Others would necessitate
-        a python loop, which would be slower. Also, everything here keeps the differentiability of a disk model
-        through the porpagation, which could be useful.
         """
         self.pca_k = pca_k
-        # self.psf_size = psf_size
         
         # 1. Load the file
         if os.path.exists(filepath):
@@ -87,12 +67,11 @@ class MirixGrid:
         self.hdul = fits.open(self.filepath)
     
         # 2. Extract information
-        with Task("Loading grid"):
-            self.components:np.ndarray = self.hdul["COMPONENTS"].data
-            self.coefficients:np.ndarray = self.hdul["COEFFICIENTS"].data
-            self.singular_values:np.ndarray = self.hdul["SINGULAR_VALUES"].data
-            self.xgrid:np.ndarray = self.hdul["X_GRID"].data
-            self.ygrid:np.ndarray = self.hdul["Y_GRID"].data
+        self.components:np.ndarray = self.hdul["COMPONENTS"].data
+        self.coefficients:np.ndarray = self.hdul["COEFFICIENTS"].data
+        self.singular_values:np.ndarray = self.hdul["SINGULAR_VALUES"].data
+        self.xgrid:np.ndarray = self.hdul["X_GRID"].data
+        self.ygrid:np.ndarray = self.hdul["Y_GRID"].data
         
         # 3. Extract metadata from hdul
         header = self.hdul[0].header
@@ -108,26 +87,9 @@ class MirixGrid:
         }
         if self.pca_k is None:
             self.pca_k = self.metadata["pca_k"]
-        #if self.grid_size is None:
-        #    self.grid_size = self.metadata["gridsize"]
-        #if self.psf_size is None:
-        #    self.psf_size = self.metadata["psf_shape"]
             
         assert self.pca_k <= self.metadata["pca_k"], f"pca_k should be less than or equal to the number of PCA components in the grid ({self.metadata['pca_k']})."
-        #assert self.grid_size <= self.metadata["gridsize"], f"grid_size should be less than or equal to the grid size in the grid ({self.metadata['gridsize']})."
-        #assert self.grid_size % 2 == 0, f"grid_size should be even, but got {self.grid_size}."
-        #assert self.psf_size <= self.metadata["psf_shape"], f"psf_size should be less than or equal to the PSF shape in the grid ({self.metadata['psf_shape']})."
-        #assert self.psf_size % 2 == 1, f"psf_size should be odd, but got {self.psf_size}."
-        
-        Message("Grid metadata:").list(self.metadata)
-        Message("Data shapes:").list({
-            "components": self.components.shape,
-            "coefficients": self.coefficients.shape,
-            "singular_values": self.singular_values.shape,
-            "xgrid": self.xgrid.shape,
-            "ygrid": self.ygrid.shape,
-        })
-        
+       
         # 4. Reshape coefficients and grids
         self.coefficients = self.coefficients.reshape((self.metadata["gridsize"], self.metadata["gridsize"], self.metadata["pca_k"]))
         self.xgrid = self.xgrid.reshape((self.metadata["gridsize"], self.metadata["gridsize"]))
@@ -142,15 +104,8 @@ class MirixGrid:
         # use next_fast_len to speed up FFTs
         self.fast_fft_shape = [next_fast_len(s) for s in self.fft_shape]
         self.components_fft = np.fft.fft2(self.components, s=self.fast_fft_shape, axes=(1, 2)) # shape (pca_k, ny, nx)
-        self.components_fft = self.components_fft.transpose((1, 2, 0)) # shape (ny, nx, pca_k)
-        
-        Message("Data shapes after reshape:").list({
-            "components": self.components.shape,
-            "coefficients": self.coefficients.shape,
-            "xgrid": self.xgrid.shape,
-            "ygrid": self.ygrid.shape,
-            "components_fft": self.components_fft.shape,
-        })
+        self._batch_first_coeffs = self.coefficients.transpose(2, 0, 1) # shape (pca_k, ny, nx)
+        # GPU's will prefer batch first stuff I guess.
         
     @property
     def shape(self) -> tuple:
@@ -207,6 +162,14 @@ class MirixGrid:
         Moreover, we can take advantage of the linearity of the Fourier transform, to sum the components
         in Fourier space first, and then only do one inverse Fourier transform at the end th get the final
         propagated image. This should be faster.
+        
+        This here is, for some reason, slower than `scipy`'s implementation.
+        Hence, this function is complemtely useless. However, when running on GPU's, this
+        is actually how we are going to compute stuff.
+        
+        Fun fact: fft is faster with scipy than numpy. Moreover, i suspect that
+        fftconvolve is anyway highly optimized in C, and all the python stuff we do
+        here is slowing us down. On a GPU, python will be very good anyway.
         """
         
         assert image.ndim == 2, f"Input image should be 2D, but got shape {image.shape}."
@@ -218,18 +181,20 @@ class MirixGrid:
         # => will be precomputed and stored in init later
         
         # 1. Get the coefficients
-        coeffs = self.coefficients # shape (ny, nx, pca_k)
-        coeffs = coeffs * image[:, :, np.newaxis] # shape (ny, nx, pca_k)
+        coeffs = self._batch_first_coeffs # shape (pca_k, ny, nx)
+        coeffs = coeffs * image[np.newaxis, :, :] # shape (pca_k, ny, nx)
         
         # 2. Go to Fourier space
-        coeffs_fft = np.fft.fft2(coeffs, s=self.fast_fft_shape, axes=(0, 1)) # shape (ny, nx, pca_k)
+        #coeffs_fft = np.fft.fft2(coeffs, s=self.fast_fft_shape, axes=(1, 2)) # shape (pca_k, ny, nx)
+        coeffs_fft = sp.fft.fft2(coeffs, s=self.fast_fft_shape, axes=(1, 2))
         
         # 3. Apply convolution in Fourier space (which is just a multiplication)
-        propagated_ffts_per_components = coeffs_fft * self.components_fft # shape (ny, nx, pca_k)
-        propagated_fft = np.sum(propagated_ffts_per_components, axis=2) # shape (ny, nx)
+        propagated_ffts_per_components = coeffs_fft * self.components_fft # shape (pca_k, ny, nx)
+        propagated_fft = np.sum(propagated_ffts_per_components, axis=0) # shape (ny, nx)
         
         # 4. Go back to real space
-        propagate = np.fft.ifft2(propagated_fft, s=self.fast_fft_shape).real # shape (ny, nx)
+        #propagate = np.fft.ifft2(propagated_fft, s=self.fast_fft_shape).real # shape (ny, nx)
+        propagate = sp.fft.ifft2(propagated_fft, s=self.fast_fft_shape).real
         
         # 5. Center the result and crop to match the input shape
         current_shape = np.array(self.fft_shape)
